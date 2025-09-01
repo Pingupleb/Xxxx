@@ -132,44 +132,161 @@ elseif ($warningCount -gt 0) { exit 1 }
 else { exit 0 }
 
 
+# ===========================
+# (3c) ALL HOSTS INVENTORY
+# ===========================
+# This block builds a unified "all hosts" list from:
+#  - VBR Managed Servers (vCenter, ESXi stand-alone, Hyper-V, Windows/Linux, etc.)
+#  - ESXi hosts from each vCenter
+#  - Protected items from recent backup sessions (uses $inventory built in (3))
+# Then it probes reachability and writes CSV + adds an HTML section.
 
+# --- helper: richer reachability probe (ICMP + common TCP ports) ---
+function Test-HostOnlinePlus {
+    param(
+        [Parameter(Mandatory=$true)][string]$Target,
+        [int[]]$Ports = @(443,445,135,22)  # mgmt-ish defaults: HTTPS/SMB/RPC/SSH
+    )
+    $o = [PSCustomObject]@{
+        Target    = $Target
+        Online    = $false
+        Ping      = $false
+        RTTms     = $null
+        Method    = $null
+        OpenPorts = @()
+    }
+    # ICMP
+    try {
+        $r = Test-Connection -ComputerName $Target -Count 1 -ErrorAction Stop
+        $o.Ping = $true; $o.Online = $true; $o.RTTms = ($r | Select-Object -First 1).ResponseTime; $o.Method = 'ICMP'
+    } catch {}
+    # TCP ports
+    foreach ($p in $Ports) {
+        try {
+            $ok = Test-NetConnection -ComputerName $Target -Port $p -InformationLevel Quiet -WarningAction SilentlyContinue
+            if ($ok) { $o.OpenPorts += $p }
+        } catch {}
+    }
+    if (-not $o.Online -and $o.OpenPorts.Count -gt 0) { $o.Online = $true; $o.Method = 'TCP' }
+    $o.OpenPorts = ($o.OpenPorts | Sort-Object | Select-Object -Unique)
+    return $o
+}
 
-mjau
+# --- collect Managed Servers (everything Veeam knows about) ---
+$managedServers = @()
+try {
+    $managedServers = Get-VBRServer | Sort-Object Name  # includes VC, Hv, Esx (standalone), Windows, Linux, etc.
+} catch {}
 
-
-# ---------------------------
-# (3b) VMware HOSTS inventory via Veeam PowerShell
-# ---------------------------
-# Optional: refresh vCenter inventory first (comment out if you don't want a rescan)
-# foreach ($vc in (Get-VBRServer -Type VC)) { Rescan-VBREntity -Entity $vc -WarningAction SilentlyContinue }
-
+# --- collect ESXi hosts from each vCenter (for host-level visibility) ---
 $vmwHosts = @()
-$vCenters = Get-VBRServer -Type VC | Sort-Object Name
-foreach ($vc in $vCenters) {
-    # List ESXi hosts known to this vCenter (via Veeam inventory)
-    $esxiHosts = Find-VBRViEntity -Server $vc -Servers
-    foreach ($h in $esxiHosts) {
-        # h.Name is the ESXi hostname/FQDN; reuse the same probe used for device inventory
-        $probe = Test-HostOnline -Target $h.Name
-        $vmwHosts += [PSCustomObject]@{
-            VCenter     = $vc.Name
-            EsxiHost    = $h.Name
-            Path        = $h.Path
-            Online      = if ($probe.Online) { 'Online' } else { 'Offline' }
-            RTTms       = $probe.RTTms
-            ProbeMethod = $probe.Method
+try {
+    $vCenters = $managedServers | Where-Object { $_.Type -eq 'VC' }
+    foreach ($vc in $vCenters) {
+        # List ESXi hosts known to this vCenter via Veeam inventory
+        $esxi = Find-VBRViEntity -Server $vc -Servers
+        foreach ($h in $esxi) {
+            $vmwHosts += [PSCustomObject]@{
+                Name      = $h.Name
+                Category  = 'ESXiHost'
+                Subtype   = 'ESXi'
+                Source    = $vc.Name
+                PortsHint = @(443)   # vCenter/ESXi mgmt port
+            }
+        }
+    }
+} catch {}
+
+# --- protected items from recent backups (from (3) inventory you already have) ---
+$protected = @()
+if ($inventory -and $inventory.Count -gt 0) {
+    foreach ($i in $inventory) {
+        $protected += [PSCustomObject]@{
+            Name       = $i.Device
+            Category   = 'ProtectedItem'
+            Subtype    = $i.LastResult
+            Source     = $i.Jobs
+            LastBackup = $i.LastBackup
+            PortsHint  = @(445,135,22,443)
         }
     }
 }
 
-# Save VMware hosts CSV
-$vmwCsv = Join-Path $reportDir ("Veeam-VMwareHosts-{0:yyyyMMdd-HHmm}.csv" -f $now)
-$vmwHosts | Sort-Object VCenter, EsxiHost | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $vmwCsv
+# --- managed servers normalized ---
+$managed = @()
+foreach ($ms in $managedServers) {
+    # Choose reasonable default port hints by type
+    $ports = switch ($ms.Type) {
+        'VC'       { @(443) }
+        'Esx'      { @(443) }
+        'Hv'       { @(5985,5986,445,135) }  # WinRM + SMB/RPC
+        'Windows'  { @(445,135,3389) }
+        'Linux'    { @(22,443) }
+        default    { @(443,445,135,22) }
+    }
+    $managed += [PSCustomObject]@{
+        Name      = $ms.Name
+        Category  = 'ManagedServer'
+        Subtype   = $ms.Type
+        Source    = 'VBR'
+        PortsHint = $ports
+    }
+}
 
-# Add to summary and HTML
-$esxiOfflineCount = ($vmwHosts | Where-Object { $_.Online -eq 'Offline' }).Count
+# --- unify (dedupe by Name, keep best info) ---
+$hostRows = @()
+$hostRows += $managed
+$hostRows += $vmwHosts
+$hostRows += $protected
 
-# Bump the header from earlier HTML with ESXi count:
+# Some names may repeat across categories; keep unioned view
+$byName = $hostRows | Group-Object Name
+$allHosts = @()
+foreach ($g in $byName) {
+    $rows = $g.Group
+    $categories = ($rows | Select-Object -ExpandProperty Category | Sort-Object -Unique) -join ', '
+    $subtypes   = ($rows | Select-Object -ExpandProperty Subtype  | Where-Object { $_ } | Sort-Object -Unique) -join ', '
+    $sources    = ($rows | Select-Object -ExpandProperty Source   | Where-Object { $_ } | Sort-Object -Unique) -join ', '
+    $lastBackup = ($rows | Where-Object { $_.PSObject.Properties.Name -contains 'LastBackup' -and $_.LastBackup } |
+                   Sort-Object LastBackup -Descending | Select-Object -ExpandProperty LastBackup -First 1)
+
+    # Merge port hints
+    $ports = @()
+    foreach ($r in $rows) { if ($r.PortsHint) { $ports += $r.PortsHint } }
+    $ports = ($ports | Sort-Object -Unique)
+    if ($ports.Count -eq 0) { $ports = @(443,445,135,22) }
+
+    # Probe
+    $probe = Test-HostOnlinePlus -Target $g.Name -Ports $ports
+
+    $allHosts += [PSCustomObject]@{
+        Name        = $g.Name
+        Categories  = $categories
+        Subtypes    = $subtypes
+        Sources     = $sources
+        LastBackup  = $lastBackup
+        Online      = if ($probe.Online) { 'Online' } else { 'Offline' }
+        Method      = $probe.Method
+        Ping        = $probe.Ping
+        RTTms       = $probe.RTTms
+        OpenPorts   = ($probe.OpenPorts -join ',')
+    }
+}
+
+# --- save CSV & update HTML ---
+$allCsv = Join-Path $reportDir ("Veeam-AllHosts-{0:yyyyMMdd-HHmm}.csv" -f $now)
+$allHosts | Sort-Object Name | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $allCsv
+
+$allOfflineCount = ($allHosts | Where-Object { $_.Online -eq 'Offline' }).Count
+
+# Add an "All Hosts" table to the HTML
+$allHostsHtml = "<h3>All Hosts Inventory</h3>" + (
+    $allHosts |
+    Select-Object Name, Categories, Subtypes, Online, OpenPorts, LastBackup, Sources |
+    ConvertTo-Html -Fragment
+)
+
+# Rebuild header to include all-hosts count
 $header = @"
 <h2>Veeam Backup Status Report</h2>
 <p>Generated: $($now.ToString("yyyy-MM-dd HH:mm"))</p>
@@ -178,26 +295,17 @@ $header = @"
 &nbsp;|&nbsp; <strong>Failures:</strong> $failedCount
 &nbsp;|&nbsp; <strong>Warnings:</strong> $warningCount
 &nbsp;|&nbsp; <strong>Offline devices (last $lookbackH h):</strong> $offlineCount
-&nbsp;|&nbsp; <strong>ESXi hosts offline:</strong> $esxiOfflineCount
+&nbsp;|&nbsp; <strong>All hosts offline:</strong> $allOfflineCount
 </p>
 <h3>Job Summary</h3>
 "@
 
-# Append an ESXi hosts table section to the HTML:
-$esxiHtml = ""
-if ($vmwHosts.Count -gt 0) {
-    $esxiHtml = "<h3>VMware Hosts Inventory</h3>" + ($vmwHosts |
-        Select-Object VCenter, EsxiHost, Online, RTTms, Path |
-        ConvertTo-Html -Fragment)
-} else {
-    $esxiHtml = "<h3>VMware Hosts Inventory</h3><p>No vCenters/ESXi hosts found in Veeam inventory.</p>"
-}
-
-# Rebuild the final HTML (reuse $bodyJobs, $offlineHtml, $footer from earlier code)
-($header + $bodyJobs + $offlineHtml + $esxiHtml + $footer + "<p>CSV (ESXi hosts): $vmwCsv</p>") |
+# Reuse $bodyJobs, $offlineHtml, $footer from earlier
+($header + $bodyJobs + $offlineHtml + $allHostsHtml + $footer + "<p>CSV (all hosts): $allCsv</p>") |
     ConvertTo-Html -Title "Veeam Backup Status" |
     Out-File -FilePath $htmlPath -Encoding UTF8
 
-# Treat any offline ESXi host as a warning if you like (optional)
-if ($esxiOfflineCount -gt 0 -and $failedCount -eq 0) { $warningCount = $warningCount + 1 }
+# Treat any offline host as a warning (tweak as you like)
+if ($allOfflineCount -gt 0 -and $failedCount -eq 0) { $warningCount = $warningCount + 1 }
+
 
