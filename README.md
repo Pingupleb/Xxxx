@@ -130,3 +130,74 @@ Write-Host "HTML: $htmlPath"
 if ($failedCount -gt 0) { exit 2 }
 elseif ($warningCount -gt 0) { exit 1 }
 else { exit 0 }
+
+
+
+
+mjau
+
+
+# ---------------------------
+# (3b) VMware HOSTS inventory via Veeam PowerShell
+# ---------------------------
+# Optional: refresh vCenter inventory first (comment out if you don't want a rescan)
+# foreach ($vc in (Get-VBRServer -Type VC)) { Rescan-VBREntity -Entity $vc -WarningAction SilentlyContinue }
+
+$vmwHosts = @()
+$vCenters = Get-VBRServer -Type VC | Sort-Object Name
+foreach ($vc in $vCenters) {
+    # List ESXi hosts known to this vCenter (via Veeam inventory)
+    $esxiHosts = Find-VBRViEntity -Server $vc -Servers
+    foreach ($h in $esxiHosts) {
+        # h.Name is the ESXi hostname/FQDN; reuse the same probe used for device inventory
+        $probe = Test-HostOnline -Target $h.Name
+        $vmwHosts += [PSCustomObject]@{
+            VCenter     = $vc.Name
+            EsxiHost    = $h.Name
+            Path        = $h.Path
+            Online      = if ($probe.Online) { 'Online' } else { 'Offline' }
+            RTTms       = $probe.RTTms
+            ProbeMethod = $probe.Method
+        }
+    }
+}
+
+# Save VMware hosts CSV
+$vmwCsv = Join-Path $reportDir ("Veeam-VMwareHosts-{0:yyyyMMdd-HHmm}.csv" -f $now)
+$vmwHosts | Sort-Object VCenter, EsxiHost | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $vmwCsv
+
+# Add to summary and HTML
+$esxiOfflineCount = ($vmwHosts | Where-Object { $_.Online -eq 'Offline' }).Count
+
+# Bump the header from earlier HTML with ESXi count:
+$header = @"
+<h2>Veeam Backup Status Report</h2>
+<p>Generated: $($now.ToString("yyyy-MM-dd HH:mm"))</p>
+<p>
+<strong>Jobs:</strong> $($rows.Count)
+&nbsp;|&nbsp; <strong>Failures:</strong> $failedCount
+&nbsp;|&nbsp; <strong>Warnings:</strong> $warningCount
+&nbsp;|&nbsp; <strong>Offline devices (last $lookbackH h):</strong> $offlineCount
+&nbsp;|&nbsp; <strong>ESXi hosts offline:</strong> $esxiOfflineCount
+</p>
+<h3>Job Summary</h3>
+"@
+
+# Append an ESXi hosts table section to the HTML:
+$esxiHtml = ""
+if ($vmwHosts.Count -gt 0) {
+    $esxiHtml = "<h3>VMware Hosts Inventory</h3>" + ($vmwHosts |
+        Select-Object VCenter, EsxiHost, Online, RTTms, Path |
+        ConvertTo-Html -Fragment)
+} else {
+    $esxiHtml = "<h3>VMware Hosts Inventory</h3><p>No vCenters/ESXi hosts found in Veeam inventory.</p>"
+}
+
+# Rebuild the final HTML (reuse $bodyJobs, $offlineHtml, $footer from earlier code)
+($header + $bodyJobs + $offlineHtml + $esxiHtml + $footer + "<p>CSV (ESXi hosts): $vmwCsv</p>") |
+    ConvertTo-Html -Title "Veeam Backup Status" |
+    Out-File -FilePath $htmlPath -Encoding UTF8
+
+# Treat any offline ESXi host as a warning if you like (optional)
+if ($esxiOfflineCount -gt 0 -and $failedCount -eq 0) { $warningCount = $warningCount + 1 }
+
